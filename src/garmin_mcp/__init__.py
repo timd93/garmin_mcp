@@ -158,6 +158,7 @@ def init_api(email, password):
     return garmin
 
 
+import asyncio
 import datetime
 import hashlib
 import time
@@ -242,6 +243,156 @@ def write_to_disk_cache(cache_key: str, data: Any):
         print(f"Error writing disk cache: {e}")
 
 
+_prefetch_started = False
+
+async def prefetch_background_daemon(garmin_client):
+    """Background task to prefetch historical Garmin Connect data and populate the disk cache."""
+    import asyncio
+    import sys
+    import os
+    import datetime
+    
+    print("[PREFETCH] Background prefetch daemon starting in 10 seconds...", file=sys.stderr, flush=True)
+    await asyncio.sleep(10)
+    
+    while True:
+        try:
+            print("[PREFETCH] Starting background prefetching cycle...", file=sys.stderr, flush=True)
+            
+            # Determine prefetch range
+            try:
+                days = int(os.environ.get("GARMIN_PREFETCH_DAYS", "180"))
+            except ValueError:
+                days = 180
+                
+            today = datetime.date.today()
+            start_date = today - datetime.timedelta(days=days)
+            start_date_str = start_date.strftime("%Y-%m-%d")
+            today_str = today.strftime("%Y-%m-%d")
+            
+            print(f"[PREFETCH] Prefetch range: {start_date_str} to {today_str} ({days} days)", file=sys.stderr, flush=True)
+            
+            # Helper to execute a query in a worker thread and cache it
+            async def fetch_and_cache(func_name, client_method_name, *method_args, **method_kwargs):
+                cache_key = get_cache_key(func_name, (), method_kwargs)
+                
+                # Check if already in disk cache
+                cached_val = read_from_disk_cache(cache_key)
+                if cached_val is not None:
+                    return cached_val
+                
+                print(f"[PREFETCH] Cache MISS for '{func_name}' with kwargs={method_kwargs}. Querying Garmin API...", file=sys.stderr, flush=True)
+                
+                def run_api():
+                    method = getattr(garmin_client, client_method_name)
+                    return method(*method_args, **method_kwargs)
+                    
+                try:
+                    result = await asyncio.to_thread(run_api)
+                    json_result = _to_json_str(result)
+                    
+                    # Store result in permanent disk cache
+                    write_to_disk_cache(cache_key, json_result)
+                    
+                    # Respect rate limits: sleep 3.0s after a real API request
+                    await asyncio.sleep(3.0)
+                    return json_result
+                except Exception as e:
+                    err_msg = str(e)
+                    print(f"[PREFETCH] Error querying '{func_name}' with kwargs={method_kwargs}: {err_msg}", file=sys.stderr, flush=True)
+                    if "429" in err_msg or "too many requests" in err_msg.lower():
+                        print("[PREFETCH] Rate limit detected. Pausing prefetcher for 15 minutes...", file=sys.stderr, flush=True)
+                        await asyncio.sleep(900)
+                    else:
+                        await asyncio.sleep(5.0)
+                    return None
+
+            # 1. Prefetch Bulk Activities
+            print("[PREFETCH] Prefetching bulk activities...", file=sys.stderr, flush=True)
+            activities_json = await fetch_and_cache(
+                "get_activities_by_date",
+                "get_activities_by_date",
+                start_date_str,
+                today_str,
+                start_date=start_date_str,
+                end_date=today_str
+            )
+            
+            activity_ids = []
+            if activities_json and activities_json.strip().startswith("["):
+                try:
+                    activities = json.loads(activities_json)
+                    if isinstance(activities, list):
+                        for act in activities:
+                            act_id = act.get("activityId")
+                            if act_id:
+                                activity_ids.append(act_id)
+                except Exception as e:
+                    print(f"[PREFETCH] Warning: Failed to parse activities list: {e}", file=sys.stderr, flush=True)
+
+            print(f"[PREFETCH] Found {len(activity_ids)} activities in the last {days} days.", file=sys.stderr, flush=True)
+
+            # 2. Prefetch Daily Wellness Metrics (Stats, Sleep, Steps, HRV, Readiness)
+            daily_endpoints = [
+                ("get_stats", "get_stats"),
+                ("get_sleep_data", "get_sleep_data"),
+                ("get_steps_data", "get_steps_data"),
+                ("get_hrv_data", "get_hrv_data"),
+                ("get_training_readiness", "get_training_readiness")
+            ]
+            
+            skipped_count = 0
+            fetched_count = 0
+            
+            for i in range(days + 1):
+                query_date = today - datetime.timedelta(days=i)
+                query_date_str = query_date.strftime("%Y-%m-%d")
+                
+                # Check each daily endpoint
+                for func_name, client_method in daily_endpoints:
+                    cache_key = get_cache_key(func_name, (), {"date": query_date_str})
+                    if read_from_disk_cache(cache_key) is not None:
+                        skipped_count += 1
+                        await asyncio.sleep(0.01)
+                        continue
+                        
+                    res = await fetch_and_cache(func_name, client_method, query_date_str, date=query_date_str)
+                    if res:
+                        fetched_count += 1
+
+            print(f"[PREFETCH] Daily wellness prefetching completed. Fetched: {fetched_count}, Skipped: {skipped_count}", file=sys.stderr, flush=True)
+
+            # 3. Prefetch Activity Details & Splits
+            act_skipped = 0
+            act_fetched = 0
+            for act_id in activity_ids:
+                # get_activity cache key
+                act_cache_key = get_cache_key("get_activity", (), {"activity_id": act_id})
+                if read_from_disk_cache(act_cache_key) is None:
+                    res = await fetch_and_cache("get_activity", "get_activity", act_id, activity_id=act_id)
+                    if res:
+                        act_fetched += 1
+                else:
+                    act_skipped += 1
+                    
+                # get_activity_splits cache key
+                splits_cache_key = get_cache_key("get_activity_splits", (), {"activity_id": act_id})
+                if read_from_disk_cache(splits_cache_key) is None:
+                    res = await fetch_and_cache("get_activity_splits", "get_activity_splits", act_id, activity_id=act_id)
+                    if res:
+                        act_fetched += 1
+                else:
+                    act_skipped += 1
+
+            print(f"[PREFETCH] Activity details prefetching completed. Fetched: {act_fetched}, Skipped: {act_skipped}", file=sys.stderr, flush=True)
+            print("[PREFETCH] Background prefetching cycle completed successfully.", file=sys.stderr, flush=True)
+            
+        except Exception as e:
+            print(f"[PREFETCH] Error in prefetch cycle: {e}", file=sys.stderr, flush=True)
+            
+        await asyncio.sleep(12 * 3600)
+
+
 def main():
     """Initialize the MCP server and register all tools"""
 
@@ -290,6 +441,13 @@ def main():
             @wraps(func)
             async def async_wrapper(*a, **kw):
                 func_name = func.__name__
+
+                # Check and start prefetch daemon if not started yet
+                global _prefetch_started
+                if not _prefetch_started and os.environ.get("GARMIN_MCP_TEST_MODE") != "true":
+                    _prefetch_started = True
+                    asyncio.create_task(prefetch_background_daemon(garmin_client))
+                    print("[PREFETCH] First tool call: Prefetch daemon scheduled.", file=sys.stderr, flush=True)
 
                 # 1. Bypass cache for writes/mutations
                 if is_write_operation(func_name):
@@ -423,6 +581,18 @@ def main():
                 self.inner = inner
 
             async def __call__(self, scope, receive, send):
+                if scope.get("type") == "lifespan":
+                    async def custom_receive():
+                        message = await receive()
+                        if message.get("type") == "lifespan.startup":
+                            global _prefetch_started
+                            if not _prefetch_started and os.environ.get("GARMIN_MCP_TEST_MODE") != "true":
+                                _prefetch_started = True
+                                asyncio.create_task(prefetch_background_daemon(garmin_client))
+                                print("[PREFETCH] ASGI lifespan startup: Prefetch daemon scheduled.", file=sys.stderr, flush=True)
+                        return message
+                    return await self.inner(scope, custom_receive, send)
+
                 if scope.get("type") == "http":
                     path_value = scope.get("path", "")
                     method = scope.get("method", "")

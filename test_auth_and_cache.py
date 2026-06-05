@@ -121,5 +121,70 @@ class TestAuthAndCache(unittest.TestCase):
         # Check non-existent key
         self.assertIsNone(read_from_disk_cache("non_existent_key"))
 
+    def test_prefetch_daemon(self):
+        import asyncio
+        from garmin_mcp import prefetch_background_daemon, get_cache_key, read_from_disk_cache
+        
+        # Configure prefetch range to 1 day for testing speed
+        os.environ["GARMIN_PREFETCH_DAYS"] = "1"
+        
+        # Setup mock client
+        mock_client = MagicMock()
+        mock_client.get_activities_by_date.return_value = [{"activityId": 99999}]
+        mock_client.get_stats.return_value = {"calories": 2000}
+        mock_client.get_sleep_data.return_value = {"sleepScore": 90}
+        mock_client.get_steps_data.return_value = {"steps": 8000}
+        mock_client.get_hrv_data.return_value = {"hrv": 55}
+        mock_client.get_training_readiness.return_value = {"readiness": 85}
+        mock_client.get_activity.return_value = {"name": "Test Run"}
+        mock_client.get_activity_splits.return_value = {"splits": []}
+        
+        async def mock_sleep(delay):
+            if delay == 12 * 3600:
+                raise KeyboardInterrupt("Cycle complete")
+            return
+            
+        # Run prefetch daemon using asyncio event loop (First run - populates cache)
+        with patch("asyncio.sleep", side_effect=mock_sleep):
+            try:
+                asyncio.run(prefetch_background_daemon(mock_client))
+            except KeyboardInterrupt:
+                pass # Expected interruption at the end of the first cycle
+                
+        # Reset mock client to clear call history
+        mock_client.reset_mock()
+        
+        # Run prefetch daemon a second time (Should hit cache for everything)
+        with patch("asyncio.sleep", side_effect=mock_sleep):
+            try:
+                asyncio.run(prefetch_background_daemon(mock_client))
+            except KeyboardInterrupt:
+                pass
+                
+        # Verify mock client was NOT called on the second run (100% cache hits!)
+        mock_client.get_stats.assert_not_called()
+        mock_client.get_sleep_data.assert_not_called()
+        mock_client.get_steps_data.assert_not_called()
+        mock_client.get_hrv_data.assert_not_called()
+        mock_client.get_training_readiness.assert_not_called()
+        mock_client.get_activity.assert_not_called()
+
+        # Verify that expected keys were written to disk cache
+        today = datetime.date.today()
+        today_str = today.strftime("%Y-%m-%d")
+        yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # 1. Activities list cache key
+        act_list_key = get_cache_key("get_activities_by_date", (), {"start_date": yesterday_str, "end_date": today_str})
+        self.assertIsNotNone(read_from_disk_cache(act_list_key))
+        
+        # 2. Daily stats cache key for today
+        stats_key = get_cache_key("get_stats", (), {"date": today_str})
+        self.assertIsNotNone(read_from_disk_cache(stats_key))
+        
+        # 3. Activity details cache key
+        act_detail_key = get_cache_key("get_activity", (), {"activity_id": 99999})
+        self.assertIsNotNone(read_from_disk_cache(act_detail_key))
+
 if __name__ == "__main__":
     unittest.main()
