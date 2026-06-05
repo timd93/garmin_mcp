@@ -312,7 +312,7 @@ def main():
                 if is_permanent_query(func_name, kw):
                     cached_val = read_from_disk_cache(cache_key)
                     if cached_val is not None:
-                        print(f"[CACHE] Disk cache HIT for '{func_name}' (key: {cache_key})", file=sys.stderr, flush=True)
+                        print(f"[CACHE] Disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                         return cached_val
 
                 # 3. Check Memory Cache (for recent/dynamic data)
@@ -321,11 +321,11 @@ def main():
                     if cache_key in _mem_cache:
                         ts, val = _mem_cache[cache_key]
                         if now - ts < _MEM_CACHE_TTL:
-                            print(f"[CACHE] Memory cache HIT for '{func_name}' (key: {cache_key})", file=sys.stderr, flush=True)
+                            print(f"[CACHE] Memory cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                             return val
 
                 # 4. Cache Miss: Execute tool in thread executor
-                print(f"[CACHE] Cache MISS for '{func_name}' (key: {cache_key}). Querying Garmin API in background thread...", file=sys.stderr, flush=True)
+                print(f"[CACHE] Cache MISS for '{func_name}' with kwargs={kw} (key: {cache_key}). Querying Garmin API in background thread...", file=sys.stderr, flush=True)
                 def run_tool_sync():
                     if inspect.iscoroutinefunction(func):
                         coro = func(*a, **kw)
