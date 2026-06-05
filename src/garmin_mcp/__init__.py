@@ -341,7 +341,7 @@ def main():
                 # Print a truncated preview of the Garmin API query result to stderr
                 result_str = str(result)
                 result_preview = (result_str[:200] + "...") if len(result_str) > 200 else result_str
-                print(f"[CACHE] Garmin API query returned result: {result_preview}", file=sys.stderr, flush=True)
+                print(f"[CACHE] Garmin API query for '{func_name}' with kwargs={kw} returned: {result_preview}", file=sys.stderr, flush=True)
 
                 # 5. Store result in appropriate cache
                 if is_permanent_query(func_name, kw):
