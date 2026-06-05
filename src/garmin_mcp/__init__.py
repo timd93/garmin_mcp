@@ -273,15 +273,15 @@ async def prefetch_background_daemon(garmin_client):
             print(f"[PREFETCH] Prefetch range: {start_date_str} to {today_str} ({days} days)", file=sys.stderr, flush=True)
             
             # Helper to execute a query in a worker thread and cache it
-            async def fetch_and_cache(func_name, client_method_name, *method_args, **method_kwargs):
-                cache_key = get_cache_key(func_name, (), method_kwargs)
+            async def fetch_and_cache(func_name, cache_kwargs, client_method_name, *method_args, **method_kwargs):
+                cache_key = get_cache_key(func_name, (), cache_kwargs)
                 
                 # Check if already in disk cache
                 cached_val = read_from_disk_cache(cache_key)
                 if cached_val is not None:
                     return cached_val
                 
-                print(f"[PREFETCH] Cache MISS for '{func_name}' with kwargs={method_kwargs}. Querying Garmin API...", file=sys.stderr, flush=True)
+                print(f"[PREFETCH] Cache MISS for '{func_name}' with kwargs={cache_kwargs}. Querying Garmin API...", file=sys.stderr, flush=True)
                 
                 def run_api():
                     method = getattr(garmin_client, client_method_name)
@@ -299,7 +299,7 @@ async def prefetch_background_daemon(garmin_client):
                     return json_result
                 except Exception as e:
                     err_msg = str(e)
-                    print(f"[PREFETCH] Error querying '{func_name}' with kwargs={method_kwargs}: {err_msg}", file=sys.stderr, flush=True)
+                    print(f"[PREFETCH] Error querying '{func_name}' with kwargs={cache_kwargs}: {err_msg}", file=sys.stderr, flush=True)
                     if "429" in err_msg or "too many requests" in err_msg.lower():
                         print("[PREFETCH] Rate limit detected. Pausing prefetcher for 15 minutes...", file=sys.stderr, flush=True)
                         await asyncio.sleep(900)
@@ -311,11 +311,11 @@ async def prefetch_background_daemon(garmin_client):
             print("[PREFETCH] Prefetching bulk activities...", file=sys.stderr, flush=True)
             activities_json = await fetch_and_cache(
                 "get_activities_by_date",
+                {"start_date": start_date_str, "end_date": today_str, "activity_type": ""},
                 "get_activities_by_date",
                 start_date_str,
                 today_str,
-                start_date=start_date_str,
-                end_date=today_str
+                None
             )
             
             activity_ids = []
@@ -356,7 +356,12 @@ async def prefetch_background_daemon(garmin_client):
                         await asyncio.sleep(0.01)
                         continue
                         
-                    res = await fetch_and_cache(func_name, client_method, query_date_str, date=query_date_str)
+                    res = await fetch_and_cache(
+                        func_name,
+                        {"date": query_date_str},
+                        client_method,
+                        query_date_str
+                    )
                     if res:
                         fetched_count += 1
 
@@ -369,7 +374,12 @@ async def prefetch_background_daemon(garmin_client):
                 # get_activity cache key
                 act_cache_key = get_cache_key("get_activity", (), {"activity_id": act_id})
                 if read_from_disk_cache(act_cache_key) is None:
-                    res = await fetch_and_cache("get_activity", "get_activity", act_id, activity_id=act_id)
+                    res = await fetch_and_cache(
+                        "get_activity",
+                        {"activity_id": act_id},
+                        "get_activity",
+                        act_id
+                    )
                     if res:
                         act_fetched += 1
                 else:
@@ -378,7 +388,12 @@ async def prefetch_background_daemon(garmin_client):
                 # get_activity_splits cache key
                 splits_cache_key = get_cache_key("get_activity_splits", (), {"activity_id": act_id})
                 if read_from_disk_cache(splits_cache_key) is None:
-                    res = await fetch_and_cache("get_activity_splits", "get_activity_splits", act_id, activity_id=act_id)
+                    res = await fetch_and_cache(
+                        "get_activity_splits",
+                        {"activity_id": act_id},
+                        "get_activity_splits",
+                        act_id
+                    )
                     if res:
                         act_fetched += 1
                 else:

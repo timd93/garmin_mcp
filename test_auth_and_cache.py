@@ -175,7 +175,7 @@ class TestAuthAndCache(unittest.TestCase):
         yesterday_str = (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
         
         # 1. Activities list cache key
-        act_list_key = get_cache_key("get_activities_by_date", (), {"start_date": yesterday_str, "end_date": today_str})
+        act_list_key = get_cache_key("get_activities_by_date", (), {"start_date": yesterday_str, "end_date": today_str, "activity_type": ""})
         self.assertIsNotNone(read_from_disk_cache(act_list_key))
         
         # 2. Daily stats cache key for today
