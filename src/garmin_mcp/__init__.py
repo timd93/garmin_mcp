@@ -72,6 +72,16 @@ def get_mfa() -> str:
 
             time.sleep(1)
 
+    # Fallback to interactive terminal input if running in an interactive session (e.g. docker run -it)
+    import sys
+    if sys.stdin.isatty():
+        try:
+            val = input("Enter Garmin Connect MFA Code: ").strip()
+            if val:
+                return val
+        except Exception:
+            pass
+
     raise RuntimeError(
         "MFA code required but not provided. Set GARMIN_MFA_CODE or GARMIN_MFA_CODE_FILE "
         "(optional: GARMIN_MFA_WAIT_SECONDS to poll)."
