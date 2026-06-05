@@ -293,6 +293,7 @@ def main():
 
                 # 1. Bypass cache for writes/mutations
                 if is_write_operation(func_name):
+                    print(f"[CACHE] Write operation '{func_name}' with args={a} kwargs={kw}. Bypassing cache.", file=sys.stderr, flush=True)
                     def run_write_sync():
                         if inspect.iscoroutinefunction(func):
                             coro = func(*a, **kw)
@@ -311,6 +312,7 @@ def main():
                 if is_permanent_query(func_name, kw):
                     cached_val = read_from_disk_cache(cache_key)
                     if cached_val is not None:
+                        print(f"[CACHE] Disk cache HIT for '{func_name}' (key: {cache_key})", file=sys.stderr, flush=True)
                         return cached_val
 
                 # 3. Check Memory Cache (for recent/dynamic data)
@@ -319,9 +321,11 @@ def main():
                     if cache_key in _mem_cache:
                         ts, val = _mem_cache[cache_key]
                         if now - ts < _MEM_CACHE_TTL:
+                            print(f"[CACHE] Memory cache HIT for '{func_name}' (key: {cache_key})", file=sys.stderr, flush=True)
                             return val
 
                 # 4. Cache Miss: Execute tool in thread executor
+                print(f"[CACHE] Cache MISS for '{func_name}' (key: {cache_key}). Querying Garmin API in background thread...", file=sys.stderr, flush=True)
                 def run_tool_sync():
                     if inspect.iscoroutinefunction(func):
                         coro = func(*a, **kw)
@@ -336,8 +340,10 @@ def main():
 
                 # 5. Store result in appropriate cache
                 if is_permanent_query(func_name, kw):
+                    print(f"[CACHE] Storing result for '{func_name}' in permanent disk cache (key: {cache_key}).", file=sys.stderr, flush=True)
                     write_to_disk_cache(cache_key, result)
                 else:
+                    print(f"[CACHE] Storing result for '{func_name}' in memory cache (key: {cache_key}).", file=sys.stderr, flush=True)
                     _mem_cache[cache_key] = (time.time(), result)
 
                 return result
