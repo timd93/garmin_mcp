@@ -219,12 +219,16 @@ def get_cache_key(func_name: str, args: tuple, kwargs: dict) -> str:
 
 from typing import Any, Optional
 
-def read_from_disk_cache(cache_key: str) -> Optional[str]:
+def read_from_disk_cache(cache_key: str, max_age_seconds: Optional[float] = None) -> Optional[str]:
     """Read cached result from disk if it exists, otherwise return None."""
     try:
         cache_dir = os.path.join(os.path.expanduser(tokenstore), "cache", "perm")
         cache_file = os.path.join(cache_dir, f"{cache_key}.json")
         if os.path.exists(cache_file):
+            if max_age_seconds is not None:
+                mtime = os.path.getmtime(cache_file)
+                if time.time() - mtime > max_age_seconds:
+                    return None
             with open(cache_file, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception as e:
@@ -273,11 +277,11 @@ async def prefetch_background_daemon(garmin_client):
             print(f"[PREFETCH] Prefetch range: {start_date_str} to {today_str} ({days} days)", file=sys.stderr, flush=True)
             
             # Helper to execute a query in a worker thread and cache it
-            async def fetch_and_cache(func_name, cache_kwargs, client_method_name, *method_args, **method_kwargs):
+            async def fetch_and_cache(func_name, cache_kwargs, client_method_name, *method_args, max_age_seconds=None, **method_kwargs):
                 cache_key = get_cache_key(func_name, (), cache_kwargs)
                 
                 # Check if already in disk cache
-                cached_val = read_from_disk_cache(cache_key)
+                cached_val = read_from_disk_cache(cache_key, max_age_seconds=max_age_seconds)
                 if cached_val is not None:
                     return cached_val
                 
@@ -315,7 +319,8 @@ async def prefetch_background_daemon(garmin_client):
                 "get_activities_by_date",
                 start_date_str,
                 today_str,
-                None
+                None,
+                max_age_seconds=14400
             )
             
             activity_ids = []
@@ -348,10 +353,15 @@ async def prefetch_background_daemon(garmin_client):
                 query_date = today - datetime.timedelta(days=i)
                 query_date_str = query_date.strftime("%Y-%m-%d")
                 
+                # Dynamic recent data (<= 7 days old) should be refreshed if older than 4 hours.
+                # Older historical data (> 7 days old) is permanent and can be skipped if present on disk.
+                is_old = is_date_older_than_7_days(query_date_str)
+                max_age = None if is_old else 14400
+                
                 # Check each daily endpoint
                 for func_name, client_method in daily_endpoints:
                     cache_key = get_cache_key(func_name, (), {"date": query_date_str})
-                    if read_from_disk_cache(cache_key) is not None:
+                    if read_from_disk_cache(cache_key, max_age_seconds=max_age) is not None:
                         skipped_count += 1
                         await asyncio.sleep(0.01)
                         continue
@@ -360,7 +370,8 @@ async def prefetch_background_daemon(garmin_client):
                         func_name,
                         {"date": query_date_str},
                         client_method,
-                        query_date_str
+                        query_date_str,
+                        max_age_seconds=max_age
                     )
                     if res:
                         fetched_count += 1
@@ -488,7 +499,7 @@ def main():
                         print(f"[CACHE] Disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                         return cached_val
 
-                # 3. Check Memory Cache (for recent/dynamic data)
+                # 3. Check Memory/Temporary Disk Cache (for recent/dynamic data)
                 else:
                     now = time.time()
                     if cache_key in _mem_cache:
@@ -496,6 +507,13 @@ def main():
                         if now - ts < _MEM_CACHE_TTL:
                             print(f"[CACHE] Memory cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                             return val
+
+                    # Check disk cache with a 4-hour TTL for recent/dynamic queries
+                    cached_val = read_from_disk_cache(cache_key, max_age_seconds=14400)
+                    if cached_val is not None:
+                        print(f"[CACHE] Recent disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
+                        _mem_cache[cache_key] = (now, cached_val)
+                        return cached_val
 
                 # 4. Cache Miss: Execute tool in thread executor
                 print(f"[CACHE] Cache MISS for '{func_name}' with kwargs={kw} (key: {cache_key}). Querying Garmin API in background thread...", file=sys.stderr, flush=True)
@@ -523,6 +541,8 @@ def main():
                 else:
                     print(f"[CACHE] Storing result for '{func_name}' in memory cache (key: {cache_key}).", file=sys.stderr, flush=True)
                     _mem_cache[cache_key] = (time.time(), result)
+                    print(f"[CACHE] Storing result for '{func_name}' in temporary disk cache (key: {cache_key}).", file=sys.stderr, flush=True)
+                    write_to_disk_cache(cache_key, result)
 
                 return result
 

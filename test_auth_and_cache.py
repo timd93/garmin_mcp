@@ -118,6 +118,14 @@ class TestAuthAndCache(unittest.TestCase):
         cached = read_from_disk_cache(test_key)
         self.assertEqual(cached, test_data)
 
+        # Verify max_age_seconds checks
+        cached_valid = read_from_disk_cache(test_key, max_age_seconds=10)
+        self.assertEqual(cached_valid, test_data)
+
+        # Verify expired caches return None
+        cached_expired = read_from_disk_cache(test_key, max_age_seconds=-1)
+        self.assertIsNone(cached_expired)
+
         # Check non-existent key
         self.assertIsNone(read_from_disk_cache("non_existent_key"))
 
