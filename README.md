@@ -22,6 +22,9 @@ Credits: https://github.com/Taxuspt/garmin_mcp
 - **Streamable HTTP Transport** - Network-accessible MCP server for Kubernetes/container deployments
 - **Token Persistence** - OAuth tokens cached to avoid repeated MFA prompts
 - **Non-interactive MFA** - Supports containerised deployments with environment-based MFA codes
+- **API Key Authentication** - Secure HTTP/SSE endpoints with Bearer token or header verification (while keeping `/healthz` endpoints public)
+- **Hybrid Memory & Disk Caching** - 5-minute memory TTL for recent/dynamic queries, and permanent disk caching for historical/static data (queries >7 days old)
+- **High Concurrency & Parallelism** - Automatically offloads blocking third-party Garmin API calls to background worker threads to keep the event loop highly responsive
 
 ## Prerequisites
 
@@ -386,6 +389,7 @@ kubectl apply -f httproute.yaml
 | `GARMIN_MCP_TRANSPORT` | Transport type: `stdio` or `streamable-http` | `http` | No |
 | `GARMIN_MCP_HOST` | Bind host for HTTP transport | `0.0.0.0` | No |
 | `GARMIN_MCP_PORT` | Port for HTTP transport | `8000` | No |
+| `GARMIN_MCP_API_KEY` | Optional API key to secure SSE/HTTP server | - | No |
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
@@ -394,6 +398,24 @@ kubectl apply -f httproute.yaml
 OAuth tokens are automatically saved to `~/.garminconnect` (or path specified by `GARMINTOKENS`) after successful login. These tokens persist across restarts, eliminating the need for MFA on subsequent runs until they expire.
 
 **For Kubernetes:** Tokens are stored in the PersistentVolumeClaim, so they persist across pod restarts and deployments.
+
+## Authentication
+
+When using the HTTP or SSE transports, the server can be secured by setting the `GARMIN_MCP_API_KEY` environment variable. If set:
+- Clients must authenticate by sending the key in either:
+  - An `Authorization` header: `Authorization: Bearer <your-api-key>`
+  - An `X-API-Key` header: `X-API-Key: <your-api-key>`
+  - A query parameter: `?api_key=<your-api-key>`
+- Kubernetes health probes (`/healthz` and `/readyz`) and the root path (`/`) remain public and return `200 OK` (returning `{"status": "ok", "service": "garmin-mcp"}`) without authentication.
+
+## Caching & Performance
+
+To optimize responsiveness and prevent hitting Garmin Connect API rate limits, the server utilizes a hybrid caching system:
+- **In-Memory Cache**: Active queries and recent data (less than 7 days old) are cached in memory with a 5-minute Time-To-Live (TTL).
+- **Disk Cache**: Historical queries (with dates older than 7 days) and completed activities (using `activity_id` or `activityId`) are permanently cached on disk (at `~/.garminconnect/cache/perm/`).
+- **Mutation Bypass**: Write and modification operations (e.g. adding weigh-ins, setting blood pressure, uploading workouts) automatically bypass the cache.
+
+Additionally, all Garmin Connect API requests are offloaded to background worker threads. This guarantees that multiple parallel requests from the MCP client are processed efficiently without blocking the main async event loop.
 
 ## Troubleshooting
 
