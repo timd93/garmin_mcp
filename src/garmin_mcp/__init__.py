@@ -86,6 +86,14 @@ tokenstore_base64 = os.getenv("GARMINTOKENS_BASE64") or "~/.garminconnect_base64
 
 def init_api(email, password):
     """Initialize Garmin API with your credentials."""
+    if os.environ.get("GARMIN_MCP_TEST_MODE") == "true":
+        print("Running in TEST MODE with mock Garmin client.")
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        mock_client.get_devices.return_value = [{"deviceId": "123", "modelName": "Fenix 7"}]
+        mock_client.get_activities.return_value = [{"activityId": 12345, "activityName": "Morning Run", "startTimeLocal": "2026-06-05 08:00:00"}]
+        mock_client.get_steps_data.return_value = [{"startDateTime": "2026-06-05T00:00:00", "steps": 10000}]
+        return mock_client
 
     try:
         # Using Oauth1 and OAuth2 token files from directory
@@ -140,8 +148,98 @@ def init_api(email, password):
     return garmin
 
 
+import datetime
+import hashlib
+import time
+
+# Global in-memory cache for short-term TTL
+# format: cache_key -> (timestamp, value)
+_mem_cache = {}
+_MEM_CACHE_TTL = 300  # 5 minutes in seconds
+
+def is_write_operation(func_name: str) -> bool:
+    """Check if the tool function is a write/mutation operation."""
+    return func_name.startswith(("add_", "set_", "update_", "delete_", "remove_", "post_", "create_"))
+
+def is_date_older_than_7_days(date_str: str) -> bool:
+    """Check if a date string in YYYY-MM-DD format is older than 7 days from today."""
+    try:
+        dt = datetime.datetime.strptime(date_str.strip(), "%Y-%m-%d").date()
+        today = datetime.date.today()
+        return (today - dt).days > 7
+    except Exception:
+        # If it fails to parse (e.g. dynamic relative string like "today", "yesterday"),
+        # treat it as recent (not older than 7 days) to prevent permanent caching of dynamic values.
+        return False
+
+def is_permanent_query(func_name: str, kwargs: dict) -> bool:
+    """Determine if query results should be cached permanently on disk.
+    
+    1. If the tool is query-only and contains activity_id or activityId.
+    2. If the tool contains date/start_date/end_date and all of them are older than 7 days.
+    """
+    if is_write_operation(func_name):
+        return False
+        
+    # Activity IDs and device IDs: completed activities or device structures are generally historical/static
+    if "activity_id" in kwargs or "activityId" in kwargs:
+        return True
+        
+    has_date_args = False
+    all_dates_old = True
+    
+    for key, val in kwargs.items():
+        if key in ("date", "start_date", "end_date") and isinstance(val, str):
+            has_date_args = True
+            if not is_date_older_than_7_days(val):
+                all_dates_old = False
+                
+    if has_date_args and all_dates_old:
+        return True
+        
+    return False
+
+def get_cache_key(func_name: str, args: tuple, kwargs: dict) -> str:
+    """Generate a unique SHA256 key for a tool function call and its arguments."""
+    # Serialize arguments reliably
+    serialized = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True, default=str)
+    args_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+    return f"{func_name}_{args_hash}"
+
+from typing import Any, Optional
+
+def read_from_disk_cache(cache_key: str) -> Optional[str]:
+    """Read cached result from disk if it exists, otherwise return None."""
+    try:
+        cache_dir = os.path.join(os.path.expanduser(tokenstore), "cache", "perm")
+        cache_file = os.path.join(cache_dir, f"{cache_key}.json")
+        if os.path.exists(cache_file):
+            with open(cache_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error reading disk cache: {e}")
+    return None
+
+def write_to_disk_cache(cache_key: str, data: Any):
+    """Write result to disk cache."""
+    try:
+        cache_dir = os.path.join(os.path.expanduser(tokenstore), "cache", "perm")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{cache_key}.json")
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+    except Exception as e:
+        print(f"Error writing disk cache: {e}")
+
+
 def main():
     """Initialize the MCP server and register all tools"""
+
+    import sys
+    original_stdout = sys.stdout
+    transport = os.environ.get("GARMIN_MCP_TRANSPORT", "http")
+    if transport == "stdio":
+        sys.stdout = sys.stderr
 
     # Initialize Garmin client
     garmin_client = init_api(email, password)
@@ -167,6 +265,78 @@ def main():
 
     # Create the MCP app
     app = FastMCP("Garmin Connect v1.0")
+
+    # Patch app.tool to support hybrid caching and thread-concurrency
+    original_tool = app.tool
+
+    def patched_tool(*args, **kwargs):
+        decorator = original_tool(*args, **kwargs)
+
+        def wrapper(func):
+            import inspect
+            from functools import wraps
+            import asyncio
+
+            @wraps(func)
+            async def async_wrapper(*a, **kw):
+                func_name = func.__name__
+
+                # 1. Bypass cache for writes/mutations
+                if is_write_operation(func_name):
+                    def run_write_sync():
+                        if inspect.iscoroutinefunction(func):
+                            coro = func(*a, **kw)
+                            try:
+                                coro.send(None)
+                            except StopIteration as e:
+                                return e.value
+                        else:
+                            return func(*a, **kw)
+                    return await asyncio.to_thread(run_write_sync)
+
+                # Generate cache key
+                cache_key = get_cache_key(func_name, a, kw)
+
+                # 2. Check Disk Cache (for historical/permanent data)
+                if is_permanent_query(func_name, kw):
+                    cached_val = read_from_disk_cache(cache_key)
+                    if cached_val is not None:
+                        return cached_val
+
+                # 3. Check Memory Cache (for recent/dynamic data)
+                else:
+                    now = time.time()
+                    if cache_key in _mem_cache:
+                        ts, val = _mem_cache[cache_key]
+                        if now - ts < _MEM_CACHE_TTL:
+                            return val
+
+                # 4. Cache Miss: Execute tool in thread executor
+                def run_tool_sync():
+                    if inspect.iscoroutinefunction(func):
+                        coro = func(*a, **kw)
+                        try:
+                            coro.send(None)
+                        except StopIteration as e:
+                            return e.value
+                    else:
+                        return func(*a, **kw)
+
+                result = await asyncio.to_thread(run_tool_sync)
+
+                # 5. Store result in appropriate cache
+                if is_permanent_query(func_name, kw):
+                    write_to_disk_cache(cache_key, result)
+                else:
+                    _mem_cache[cache_key] = (time.time(), result)
+
+                return result
+
+            return decorator(async_wrapper)
+
+        return wrapper
+
+    app.tool = patched_tool
 
     # Register tools from all modules
     app = activity_management.register_tools(app)
@@ -222,18 +392,22 @@ def main():
         port = 8000
 
     if transport == "stdio":
+        sys.stdout = original_stdout
         app.run()
     else:
         print(f"Starting MCP with transport={transport}, host={host}, port={port}, path={path}")
-        # Provide simple health endpoints by wrapping the ASGI app when possible
-        class _HealthWrapper:
+        # Provide simple health and authorization checks by wrapping the ASGI app when possible
+        class _AuthAndHealthWrapper:
             def __init__(self, inner):
                 self.inner = inner
 
             async def __call__(self, scope, receive, send):
-                if scope.get("type") == "http" and scope.get("method") == "GET":
+                if scope.get("type") == "http":
                     path_value = scope.get("path", "")
-                    if path_value in ("/", "/healthz", "/readyz"):
+                    method = scope.get("method", "")
+                    
+                    # 1. Handle public health routes
+                    if method == "GET" and path_value in ("/", "/healthz", "/readyz"):
                         body = b'{"status":"ok","service":"garmin-mcp"}'
                         await send({
                             "type": "http.response.start",
@@ -242,6 +416,38 @@ def main():
                         })
                         await send({"type": "http.response.body", "body": body})
                         return
+                    
+                    # 2. Check simple API key auth if GARMIN_MCP_API_KEY is configured
+                    api_key = os.environ.get("GARMIN_MCP_API_KEY")
+                    if api_key:
+                        headers = dict(scope.get("headers", []))
+                        auth_header = headers.get(b"authorization", b"").decode("utf-8")
+                        api_key_header = headers.get(b"x-api-key", b"").decode("utf-8")
+                        
+                        # Parse query string for ?api_key=...
+                        query_string = scope.get("query_string", b"").decode("utf-8")
+                        import urllib.parse
+                        query_params = urllib.parse.parse_qs(query_string)
+                        api_key_query = query_params.get("api_key", [None])[0]
+                        
+                        authorized = False
+                        if auth_header == f"Bearer {api_key}":
+                            authorized = True
+                        elif api_key_header == api_key:
+                            authorized = True
+                        elif api_key_query == api_key:
+                            authorized = True
+                            
+                        if not authorized:
+                            body = b'{"error":"Unauthorized"}'
+                            await send({
+                                "type": "http.response.start",
+                                "status": 401,
+                                "headers": [(b"content-type", b"application/json")],
+                            })
+                            await send({"type": "http.response.body", "body": body})
+                            return
+                            
                 return await self.inner(scope, receive, send)
 
         # Aggressively monkey-patch uvicorn at multiple levels to force 0.0.0.0 binding
@@ -288,15 +494,22 @@ def main():
         # Try to locate the underlying ASGI app and run it directly (wrapped) so health endpoints work
         try:
             import uvicorn  # type: ignore
-            underlying = getattr(app, "app", None) or getattr(app, "asgi", None) or getattr(app, "asgi_app", None) or getattr(app, "_app", None)
+            underlying = None
+            if transport == "streamable-http" and hasattr(app, "streamable_http_app"):
+                underlying = app.streamable_http_app()
+            elif transport == "sse" and hasattr(app, "sse_app"):
+                underlying = app.sse_app()
+
             if underlying is None:
-                for factory_name in ("build_asgi", "create_asgi", "make_asgi_app"):
-                    factory = getattr(app, factory_name, None)
-                    if callable(factory):
-                        underlying = factory()
-                        break
+                underlying = getattr(app, "app", None) or getattr(app, "asgi", None) or getattr(app, "asgi_app", None) or getattr(app, "_app", None)
+                if underlying is None:
+                    for factory_name in ("build_asgi", "create_asgi", "make_asgi_app"):
+                        factory = getattr(app, factory_name, None)
+                        if callable(factory):
+                            underlying = factory()
+                            break
             if underlying is not None:
-                wrapped = _HealthWrapper(underlying)
+                wrapped = _AuthAndHealthWrapper(underlying)
                 uvicorn.run(wrapped, host=host, port=port)
                 return
         except Exception:

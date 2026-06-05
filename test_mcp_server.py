@@ -6,6 +6,8 @@ This script tests the MCP server directly without needing Claude Desktop
 import asyncio
 import sys
 import json
+
+sys.stdout.reconfigure(encoding='utf-8')
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -20,7 +22,7 @@ load_dotenv()
 async def test_mcp_server():
     """Test MCP server by simulating a client connection"""
     # Path to the server script
-    server_script = Path(__file__).parent / "garmin_mcp_server.py"
+    server_script = Path(__file__).parent / "src" / "garmin_mcp" / "__init__.py"
 
     if not server_script.exists():
         print(f"ERROR: Server script not found at {server_script}")
@@ -29,10 +31,15 @@ async def test_mcp_server():
     print(f"Testing MCP server at: {server_script}")
 
     # Create server parameters
+    import os
+    env = os.environ.copy()
+    env["GARMIN_MCP_TRANSPORT"] = "stdio"
+    env["GARMIN_MCP_TEST_MODE"] = "true"
+
     server_params = StdioServerParameters(
-        command="python",
+        command=sys.executable,
         args=[str(server_script)],
-        env=None,  # Uses current environment which includes .env variables
+        env=env,
     )
 
     try:
@@ -67,7 +74,7 @@ async def test_mcp_server():
                 print("\nTesting get_steps_data...")
                 try:
                     result = await session.call_tool(
-                        "get_steps_data", arguments={}  # Uses default date (today)
+                        "get_steps_data", arguments={"date": "2026-06-05"}
                     )
                     print(f"Result: {result.content[0].text[:500]}...")
                 except Exception as e:
@@ -77,6 +84,8 @@ async def test_mcp_server():
 
     except Exception as e:
         print(f"ERROR: Failed to connect to MCP server: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
