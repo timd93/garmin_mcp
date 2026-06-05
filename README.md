@@ -390,6 +390,7 @@ kubectl apply -f httproute.yaml
 | `GARMIN_MCP_HOST` | Bind host for HTTP transport | `0.0.0.0` | No |
 | `GARMIN_MCP_PORT` | Port for HTTP transport | `8000` | No |
 | `GARMIN_MCP_API_KEY` | Optional API key to secure SSE/HTTP server | - | No |
+| `GARMIN_PREFETCH_DAYS` | Number of days to prefetch historical data | `180` | No |
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
