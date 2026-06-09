@@ -247,6 +247,173 @@ def write_to_disk_cache(cache_key: str, data: Any):
         print(f"Error writing disk cache: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Shared HTTP guard + helpers for the read-only /api/health-export endpoint.
+# These reuse the same API-key check and disk-cache infrastructure the MCP
+# transport already relies on, so no second auth path / tunnel is introduced.
+# ---------------------------------------------------------------------------
+
+def _is_authorized(scope) -> bool:
+    """Shared API-key guard used by the MCP transport and the REST endpoint.
+
+    Open when GARMIN_MCP_API_KEY is unset; otherwise accepts a matching
+    ``Authorization: Bearer <key>`` header, ``X-Api-Key`` header, or
+    ``?api_key=`` query param.
+    """
+    api_key = os.environ.get("GARMIN_MCP_API_KEY")
+    if not api_key:
+        return True
+
+    import urllib.parse
+
+    headers = dict(scope.get("headers", []))
+    auth_header = headers.get(b"authorization", b"").decode("utf-8")
+    api_key_header = headers.get(b"x-api-key", b"").decode("utf-8")
+    query_params = urllib.parse.parse_qs(scope.get("query_string", b"").decode("utf-8"))
+    api_key_query = query_params.get("api_key", [None])[0]
+
+    return (
+        auth_header == f"Bearer {api_key}"
+        or api_key_header == api_key
+        or api_key_query == api_key
+    )
+
+
+async def _send_json(send, status: int, body):
+    """Write a JSON ASGI response."""
+    payload = json.dumps(body, default=str).encode("utf-8")
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [(b"content-type", b"application/json")],
+    })
+    await send({"type": "http.response.body", "body": payload})
+
+
+_health_export_offset_cache = {"value": None}
+
+
+def _parse_offset_minutes(text: str) -> int:
+    """Parse a UTC-offset override like ``+02:00``, ``-0500``, or plain minutes."""
+    text = text.strip()
+    sign = 1
+    if text and text[0] in "+-":
+        sign = -1 if text[0] == "-" else 1
+        text = text[1:]
+    if ":" in text:
+        hh, mm = text.split(":", 1)
+        return sign * (int(hh) * 60 + int(mm))
+    return sign * int(text)
+
+
+def _find_timezone_name(obj, depth: int = 0):
+    """Best-effort search of a profile-settings payload for an IANA tz string."""
+    if depth > 3:
+        return None
+    if isinstance(obj, str):
+        return obj if ("/" in obj and len(obj) <= 64) else None
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if "timezone" in key.lower() or "time_zone" in key.lower():
+                found = _find_timezone_name(val, depth + 1)
+                if found:
+                    return found
+        for val in obj.values():
+            found = _find_timezone_name(val, depth + 1)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for val in obj:
+            found = _find_timezone_name(val, depth + 1)
+            if found:
+                return found
+    return None
+
+
+def get_health_export_offset_minutes(client) -> int:
+    """Resolve the UTC offset (minutes) to stamp on exported timestamps.
+
+    Precedence: ``GARMIN_HEALTH_EXPORT_UTC_OFFSET`` env override -> the user's
+    Garmin profile timezone (via zoneinfo, memoized) -> UTC (0). Calling the
+    profile endpoint also doubles as a session-liveness probe so a dead Garmin
+    session surfaces as 502 rather than an all-empty bundle.
+    """
+    import sys
+
+    env = os.environ.get("GARMIN_HEALTH_EXPORT_UTC_OFFSET")
+    if env:
+        try:
+            return _parse_offset_minutes(env)
+        except Exception:
+            print(
+                f"[HEALTH-EXPORT] Invalid GARMIN_HEALTH_EXPORT_UTC_OFFSET={env!r}; ignoring.",
+                file=sys.stderr, flush=True,
+            )
+
+    if _health_export_offset_cache["value"] is not None:
+        return _health_export_offset_cache["value"]
+
+    minutes = 0
+    settings = client.get_userprofile_settings()  # may raise -> caller maps to 502
+    tzname = _find_timezone_name(settings)
+    if tzname:
+        try:
+            from zoneinfo import ZoneInfo
+            off = datetime.datetime.now(ZoneInfo(tzname)).utcoffset()
+            if off is not None:
+                minutes = int(off.total_seconds() // 60)
+        except Exception as e:
+            print(f"[HEALTH-EXPORT] Could not resolve tz {tzname!r}: {e}",
+                  file=sys.stderr, flush=True)
+    _health_export_offset_cache["value"] = minutes
+    return minutes
+
+
+class _HealthExportCachedClient:
+    """Disk-cached facade over the live Garmin client for the export endpoint.
+
+    Uses the existing on-disk cache helpers but under an isolated key prefix so
+    it never collides with the MCP tool / prefetch cache entries. Recent dates
+    (<= 7 days) get a 4-hour TTL; older dates are treated as permanent. This
+    keeps a wide date-range export from fanning out into a rate-limit-tripping
+    storm of repeated live Garmin calls.
+    """
+
+    _PER_DAY = (
+        "get_hrv_data", "get_spo2_data", "get_respiration_data",
+        "get_rhr_day", "get_max_metrics", "get_hydration_data",
+    )
+
+    def __init__(self, real):
+        self._real = real
+
+    def _cached(self, name, cache_kwargs, max_age, *call_args):
+        key = "healthexport_" + get_cache_key(name, (), cache_kwargs)
+        cached = read_from_disk_cache(key, max_age_seconds=max_age)
+        if cached is not None:
+            return cached
+        result = getattr(self._real, name)(*call_args)
+        write_to_disk_cache(key, result)
+        return result
+
+    def __getattr__(self, name):
+        # Only reached for attributes not found normally (i.e. the per-day
+        # getters); everything else (incl. _real) resolves before this.
+        if name in self._PER_DAY:
+            def call(cdate):
+                max_age = None if is_date_older_than_7_days(cdate) else 14400
+                return self._cached(name, {"date": cdate}, max_age, cdate)
+            return call
+        return getattr(self._real, name)
+
+    def get_blood_pressure(self, start, end):
+        max_age = None if is_date_older_than_7_days(end) else 14400
+        return self._cached(
+            "get_blood_pressure", {"start_date": start, "end_date": end},
+            max_age, start, end,
+        )
+
+
 _prefetch_started = False
 
 async def prefetch_background_daemon(garmin_client):
@@ -495,7 +662,7 @@ def main():
                 # 2. Check Disk Cache (for historical/permanent data)
                 if is_permanent_query(func_name, kw):
                     cached_val = read_from_disk_cache(cache_key)
-                    if cached_val is not None:
+                    if cached_val is not None and not (isinstance(cached_val, str) and cached_val.startswith("Error ")):
                         print(f"[CACHE] Disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                         return cached_val
 
@@ -504,13 +671,13 @@ def main():
                     now = time.time()
                     if cache_key in _mem_cache:
                         ts, val = _mem_cache[cache_key]
-                        if now - ts < _MEM_CACHE_TTL:
+                        if now - ts < _MEM_CACHE_TTL and not (isinstance(val, str) and val.startswith("Error ")):
                             print(f"[CACHE] Memory cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                             return val
 
                     # Check disk cache with a 4-hour TTL for recent/dynamic queries
                     cached_val = read_from_disk_cache(cache_key, max_age_seconds=14400)
-                    if cached_val is not None:
+                    if cached_val is not None and not (isinstance(cached_val, str) and cached_val.startswith("Error ")):
                         print(f"[CACHE] Recent disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                         _mem_cache[cache_key] = (now, cached_val)
                         return cached_val
@@ -534,8 +701,10 @@ def main():
                 result_preview = (result_str[:200] + "...") if len(result_str) > 200 else result_str
                 print(f"[CACHE] Garmin API query for '{func_name}' with kwargs={kw} returned: {result_preview}", file=sys.stderr, flush=True)
 
-                # 5. Store result in appropriate cache
-                if is_permanent_query(func_name, kw):
+                # 5. Store result in appropriate cache (skip on transient errors)
+                if isinstance(result, str) and result.startswith("Error "):
+                    print(f"[CACHE] Skipping cache for '{func_name}' due to error result (key: {cache_key}).", file=sys.stderr, flush=True)
+                elif is_permanent_query(func_name, kw):
                     print(f"[CACHE] Storing result for '{func_name}' in permanent disk cache (key: {cache_key}).", file=sys.stderr, flush=True)
                     write_to_disk_cache(cache_key, result)
                 else:
@@ -643,38 +812,49 @@ def main():
                         await send({"type": "http.response.body", "body": body})
                         return
                     
-                    # 2. Check simple API key auth if GARMIN_MCP_API_KEY is configured
-                    api_key = os.environ.get("GARMIN_MCP_API_KEY")
-                    if api_key:
-                        headers = dict(scope.get("headers", []))
-                        auth_header = headers.get(b"authorization", b"").decode("utf-8")
-                        api_key_header = headers.get(b"x-api-key", b"").decode("utf-8")
-                        
-                        # Parse query string for ?api_key=...
-                        query_string = scope.get("query_string", b"").decode("utf-8")
-                        import urllib.parse
-                        query_params = urllib.parse.parse_qs(query_string)
-                        api_key_query = query_params.get("api_key", [None])[0]
-                        
-                        authorized = False
-                        if auth_header == f"Bearer {api_key}":
-                            authorized = True
-                        elif api_key_header == api_key:
-                            authorized = True
-                        elif api_key_query == api_key:
-                            authorized = True
-                            
-                        if not authorized:
-                            body = b'{"error":"Unauthorized"}'
-                            await send({
-                                "type": "http.response.start",
-                                "status": 401,
-                                "headers": [(b"content-type", b"application/json")],
-                            })
-                            await send({"type": "http.response.body", "body": body})
-                            return
-                            
+                    # 2. Shared API-key guard (same check used for the MCP transport)
+                    if not _is_authorized(scope):
+                        await _send_json(send, 401, {"error": "Unauthorized"})
+                        return
+
+                    # 3. Read-only health-export bundle endpoint (now authorized)
+                    if method == "GET" and path_value == "/api/health-export":
+                        await self._handle_health_export(scope, send)
+                        return
+
                 return await self.inner(scope, receive, send)
+
+            async def _handle_health_export(self, scope, send):
+                """Build the normalized Health-Connect bundle for ?start/&end/&types."""
+                import datetime as _dt
+                import urllib.parse
+
+                try:
+                    from health_export.route import parse_and_validate, ParamError
+                    from health_export.service import build_bundle
+                except Exception as ex:  # package not importable in this env
+                    await _send_json(send, 500, {"error": f"health-export unavailable: {ex}"})
+                    return
+
+                query_string = scope.get("query_string", b"").decode("utf-8")
+                raw_q = {k: v[0] for k, v in urllib.parse.parse_qs(query_string).items()}
+
+                try:
+                    params = parse_and_validate(raw_q, today=_dt.date.today().isoformat())
+                except ParamError as pe:
+                    await _send_json(send, 400, {"error": pe.message})
+                    return
+
+                try:
+                    offset = get_health_export_offset_minutes(garmin_client)
+                    client = _HealthExportCachedClient(garmin_client)
+                    bundle = await asyncio.to_thread(
+                        build_bundle, client, params.start, params.end, offset, params.types)
+                except Exception as ex:  # dead/unauthenticated Garmin session
+                    await _send_json(send, 502, {"error": f"garmin session unavailable: {ex}"})
+                    return
+
+                await _send_json(send, 200, bundle)
 
         # Aggressively monkey-patch uvicorn at multiple levels to force 0.0.0.0 binding
         if host == "0.0.0.0":

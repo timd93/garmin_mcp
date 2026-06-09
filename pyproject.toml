@@ -16,6 +16,9 @@ dependencies = [
     "garth==0.5.2",
 ]
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/garmin_mcp", "src/health_export"]
+
 [project.scripts]
 garmin-mcp = "garmin_mcp:main"
 

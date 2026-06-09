@@ -117,6 +117,29 @@ Edit your Claude Desktop configuration:
 
 Restart Claude Desktop after making changes.
 
+#### Connecting an MCP client over HTTP (with API key)
+
+The stdio config above launches the server locally. To connect to a server that
+is already running over HTTP (`GARMIN_MCP_TRANSPORT=streamable-http`, see the
+Docker/Kubernetes sections), point your MCP client at the `/mcp` endpoint and
+pass the API key. When `GARMIN_MCP_API_KEY` is set, send it as a Bearer token
+(or `X-API-Key` header, or `?api_key=` query param):
+
+```json
+{
+  "mcpServers": {
+    "garmin": {
+      "type": "streamable-http",
+      "url": "https://your-domain/mcp",
+      "headers": { "Authorization": "Bearer your-api-key" }
+    }
+  }
+}
+```
+
+If your client cannot send custom headers, append the key to the URL instead:
+`"url": "https://your-domain/mcp?api_key=your-api-key"`.
+
 ### 2. Docker Deployment
 
 #### Build the Image
@@ -391,6 +414,7 @@ kubectl apply -f httproute.yaml
 | `GARMIN_MCP_PORT` | Port for HTTP transport | `8000` | No |
 | `GARMIN_MCP_API_KEY` | Optional API key to secure SSE/HTTP server | - | No |
 | `GARMIN_PREFETCH_DAYS` | Number of days to prefetch historical data | `180` | No |
+| `GARMIN_HEALTH_EXPORT_UTC_OFFSET` | UTC offset for `/api/health-export` timestamps (e.g. `+02:00`, `-0500`, or minutes like `120`). Overrides the timezone read from your Garmin profile | from profile | No |
 
 *Required only if MFA is enabled on your Garmin Connect account, and only on first run or when tokens expire
 
@@ -408,6 +432,85 @@ When using the HTTP or SSE transports, the server can be secured by setting the 
   - An `X-API-Key` header: `X-API-Key: <your-api-key>`
   - A query parameter: `?api_key=<your-api-key>`
 - Kubernetes health probes (`/healthz` and `/readyz`) and the root path (`/`) remain public and return `200 OK` (returning `{"status": "ok", "service": "garmin-mcp"}`) without authentication.
+
+## Health Export REST Endpoint
+
+In addition to the MCP transport, the HTTP server exposes a single read-only REST
+endpoint that returns the Health-Connect-supported metrics Garmin does not push
+natively, as one normalized JSON bundle:
+
+```
+GET /api/health-export?start=YYYY-MM-DD[&end=YYYY-MM-DD][&types=hrv,spo2,...]
+```
+
+- **Auth:** protected by the same `GARMIN_MCP_API_KEY` guard described above
+  (Bearer header, `X-API-Key`, or `?api_key=`). Same Cloudflare Tunnel — no new
+  tunnel/DNS.
+- **Params:** `start` is required; `end` defaults to today; `types` is an
+  optional CSV subset of `hrv,spo2,respiration,resting_hr,vo2max,blood_pressure,hydration`
+  (omit for all). The range is capped at 370 days.
+- **Response:** one array per metric plus an `errors[]` array. Every timestamp is
+  timezone-aware ISO-8601 with an explicit offset (e.g. `2026-06-07T03:14:00+02:00`).
+  The offset comes from `GARMIN_HEALTH_EXPORT_UTC_OFFSET` if set, otherwise from
+  your Garmin profile timezone.
+- **Resilience:** a failure on a single metric/day is recorded in `errors[]` and
+  the request still returns `200` with everything else. `401` on a bad key, `400`
+  on invalid params, `502` if the Garmin session is unavailable.
+- **Caching:** per-day results are cached on disk (isolated from the MCP tool
+  cache) so overlapping/repeated exports don't re-hit Garmin's rate limiter.
+
+#### Metric types
+
+| `types` value | Source | Records |
+|---------------|--------|---------|
+| `hrv` | `get_hrv_data` | granular `hrvReadings`, else nightly average (`rmssd_ms`) |
+| `spo2` | `get_spo2_data` | `{time, percent}` |
+| `respiration` | `get_respiration_data` | `{time, breaths_per_min}` |
+| `resting_hr` | `get_rhr_day` | one daily `{date, time, bpm}` |
+| `vo2max` | `get_max_metrics` | one daily `{date, time, value, sport}` per sport |
+| `blood_pressure` | `get_blood_pressure` | `{time, systolic, diastolic, pulse}` |
+| `hydration` | `get_hydration_data` | one daily `{date, start, end, volume_ml}` |
+
+#### Authenticating the request
+
+Pass the API key exactly like the MCP transport — any one of:
+
+```bash
+# Bearer header
+curl -s -H "Authorization: Bearer your-api-key" \
+  "https://your-domain/api/health-export?start=2026-06-06&end=2026-06-07"
+
+# X-API-Key header
+curl -s -H "X-API-Key: your-api-key" \
+  "https://your-domain/api/health-export?start=2026-06-06"
+
+# query parameter (handy for quick checks)
+curl -s "http://localhost:8000/api/health-export?start=2026-06-06&end=2026-06-07&api_key=your-api-key"
+
+# limit to specific metrics
+curl -s -H "Authorization: Bearer your-api-key" \
+  "https://your-domain/api/health-export?start=2026-06-06&types=hrv,spo2,resting_hr"
+```
+
+#### Example response
+
+```json
+{
+  "start": "2026-06-06",
+  "end": "2026-06-07",
+  "generated_at": "2026-06-08T10:00:00+02:00",
+  "hrv": [
+    { "time": "2026-06-07T03:14:00+02:00", "rmssd_ms": 42.0, "granularity": "reading" }
+  ],
+  "spo2": [ { "time": "2026-06-07T03:14:00+02:00", "percent": 96 } ],
+  "respiration": [ { "time": "2026-06-07T03:14:00+02:00", "breaths_per_min": 14.0 } ],
+  "resting_hr": [ { "date": "2026-06-07", "time": "2026-06-07T00:00:00+02:00", "bpm": 52 } ],
+  "vo2max": [ { "date": "2026-06-07", "time": "2026-06-07T00:00:00+02:00", "value": 48.2, "sport": "running" } ],
+  "blood_pressure": [],
+  "hydration": [ { "date": "2026-06-07", "start": "2026-06-07T00:00:00+02:00", "end": "2026-06-07T23:59:59+02:00", "volume_ml": 1500 } ],
+  "errors": []
+}
+```
 
 ## Caching & Performance
 
