@@ -392,20 +392,14 @@ class _HealthExportCachedClient:
         self._real = real
 
     def _cached(self, name, cache_kwargs, max_age, *call_args):
-        # Try the shared MCP/prefetch cache first (no prefix) — avoids redundant live calls.
-        shared_key = get_cache_key(name, (), cache_kwargs)
-        cached = read_from_disk_cache(shared_key, max_age_seconds=max_age)
-        if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
-            return cached
-        # Fall back to the health-export-specific cache slot.
-        he_key = "healthexport_" + shared_key
+        he_key = "healthexport_" + get_cache_key(name, (), cache_kwargs)
         cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
         if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
             return cached
         # Cache miss — serialise live API calls: the Garmin client is not thread-safe
         # and the API rate-limits concurrent requests.
         with _garmin_api_lock:
-            # Re-check cache inside the lock in case another thread just populated it.
+            # Re-check inside the lock in case another thread just populated it.
             cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
             if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
                 return cached
