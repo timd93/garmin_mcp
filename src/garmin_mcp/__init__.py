@@ -4,6 +4,7 @@ Modular MCP Server for Garmin Connect Data
 
 import json
 import os
+import threading
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -369,6 +370,9 @@ def get_health_export_offset_minutes(client) -> int:
     return minutes
 
 
+_garmin_api_lock = threading.Lock()
+
+
 class _HealthExportCachedClient:
     """Disk-cached facade over the live Garmin client for the export endpoint.
 
@@ -398,7 +402,14 @@ class _HealthExportCachedClient:
         cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
         if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
             return cached
-        result = getattr(self._real, name)(*call_args)
+        # Cache miss — serialise live API calls: the Garmin client is not thread-safe
+        # and the API rate-limits concurrent requests.
+        with _garmin_api_lock:
+            # Re-check cache inside the lock in case another thread just populated it.
+            cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
+            if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
+                return cached
+            result = getattr(self._real, name)(*call_args)
         write_to_disk_cache(he_key, result)
         return result
 
