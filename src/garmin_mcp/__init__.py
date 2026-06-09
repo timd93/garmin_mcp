@@ -388,12 +388,18 @@ class _HealthExportCachedClient:
         self._real = real
 
     def _cached(self, name, cache_kwargs, max_age, *call_args):
-        key = "healthexport_" + get_cache_key(name, (), cache_kwargs)
-        cached = read_from_disk_cache(key, max_age_seconds=max_age)
-        if cached is not None:
+        # Try the shared MCP/prefetch cache first (no prefix) — avoids redundant live calls.
+        shared_key = get_cache_key(name, (), cache_kwargs)
+        cached = read_from_disk_cache(shared_key, max_age_seconds=max_age)
+        if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
+            return cached
+        # Fall back to the health-export-specific cache slot.
+        he_key = "healthexport_" + shared_key
+        cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
+        if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
             return cached
         result = getattr(self._real, name)(*call_args)
-        write_to_disk_cache(key, result)
+        write_to_disk_cache(he_key, result)
         return result
 
     def __getattr__(self, name):
@@ -846,10 +852,15 @@ def main():
                     return
 
                 try:
+                    import sys as _sys, time as _time
                     offset = get_health_export_offset_minutes(garmin_client)
                     client = _HealthExportCachedClient(garmin_client)
+                    _t0 = _time.monotonic()
+                    print(f"[HEALTH-EXPORT] Building bundle {params.start}..{params.end} types={params.types}", file=_sys.stderr, flush=True)
                     bundle = await asyncio.to_thread(
                         build_bundle, client, params.start, params.end, offset, params.types)
+                    _elapsed = _time.monotonic() - _t0
+                    print(f"[HEALTH-EXPORT] Bundle done in {_elapsed:.1f}s — errors={len(bundle.get('errors', []))}", file=_sys.stderr, flush=True)
                 except Exception as ex:  # dead/unauthenticated Garmin session
                     await _send_json(send, 502, {"error": f"garmin session unavailable: {ex}"})
                     return
