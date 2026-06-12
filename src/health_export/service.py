@@ -90,9 +90,11 @@ def build_bundle(client, start: str, end: str, offset_minutes: int, types):
                 bundle[metric].extend(items)
             bundle["errors"].extend(errors)
 
-    # Sort each metric array by startTimestampGMT for deterministic output.
+    # Sort each metric array chronologically for deterministic output —
+    # as_completed() yields days in nondeterministic order. Rows carry "time"
+    # except hydration, whose interval rows carry "start".
     for metric in ALL_TYPES:
         if metric != "blood_pressure":
-            bundle[metric].sort(key=lambda r: r.get("startTimestampGMT", ""))
+            bundle[metric].sort(key=lambda r: r.get("time") or r.get("start") or "")
 
     return bundle

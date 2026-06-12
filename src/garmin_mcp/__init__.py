@@ -4,6 +4,7 @@ Modular MCP Server for Garmin Connect Data
 
 import json
 import os
+import sys
 import threading
 
 import requests
@@ -211,6 +212,24 @@ def is_permanent_query(func_name: str, kwargs: dict) -> bool:
         
     return False
 
+def is_empty_result(result) -> bool:
+    """Check if a Garmin result carries no data: None, empty str/dict/list,
+    or a JSON string encoding null/{}/[].
+
+    Empty results for recent dates (within the last 7 days) must not be
+    cached — the data may simply not have synced from the watch yet, and a
+    cached empty snapshot would otherwise be served for the TTL window (or
+    forever, once the date crosses the 7-day permanent-cache boundary).
+    """
+    if result is None:
+        return True
+    if isinstance(result, (dict, list, tuple)):
+        return len(result) == 0
+    if isinstance(result, str):
+        stripped = result.strip()
+        return stripped in ("", "null", "{}", "[]", '""')
+    return False
+
 def get_cache_key(func_name: str, args: tuple, kwargs: dict) -> str:
     """Generate a unique SHA256 key for a tool function call and its arguments."""
     # Serialize arguments reliably
@@ -246,6 +265,33 @@ def write_to_disk_cache(cache_key: str, data: Any):
             json.dump(data, f, indent=2, default=str)
     except Exception as e:
         print(f"Error writing disk cache: {e}")
+
+def delete_from_disk_cache(cache_key: str):
+    """Remove a cache entry from disk, if present."""
+    try:
+        cache_file = os.path.join(os.path.expanduser(tokenstore), "cache", "perm", f"{cache_key}.json")
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+    except Exception as e:
+        print(f"Error deleting disk cache: {e}")
+
+def read_recent_from_disk_cache(cache_key: str, max_age_seconds: Optional[float] = None) -> Optional[str]:
+    """Read a disk-cache entry for a recent/dynamic query.
+
+    Empty entries (e.g. written before empty-result caching was disabled) are
+    deleted and treated as misses, so a no-data snapshot can neither be served
+    stale nor silently become permanent once its date ages past 7 days.
+    """
+    val = read_from_disk_cache(cache_key)
+    if val is None:
+        return None
+    if is_empty_result(val):
+        print(f"[CACHE] Cleaning empty cached entry for recent/dynamic query (key: {cache_key}).", file=sys.stderr, flush=True)
+        delete_from_disk_cache(cache_key)
+        return None
+    if max_age_seconds is not None:
+        return read_from_disk_cache(cache_key, max_age_seconds=max_age_seconds)
+    return val
 
 
 # ---------------------------------------------------------------------------
@@ -395,25 +441,38 @@ class _HealthExportCachedClient:
         shared_key = get_cache_key(name, (), cache_kwargs)
         he_key = "healthexport_" + shared_key
 
+        # For recent dates (max_age set) empty cached entries are cleaned from
+        # disk and treated as misses: the data may not have synced yet.
+        def read_cache(key):
+            if max_age is not None:
+                return read_recent_from_disk_cache(key, max_age_seconds=max_age)
+            return read_from_disk_cache(key)
+
+        def usable(val):
+            return val is not None and not (isinstance(val, str) and val.startswith("Error "))
+
         # Try shared MCP/prefetch cache first — but only accept raw dicts/lists,
         # not processed strings like "No HRV data found for <date>."
-        cached = read_from_disk_cache(shared_key, max_age_seconds=max_age)
+        cached = read_cache(shared_key)
         if isinstance(cached, (dict, list)):
             return cached
 
-        cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
-        if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
+        cached = read_cache(he_key)
+        if usable(cached):
             return cached
 
         # Cache miss — serialise live API calls: the Garmin client is not thread-safe
         # and the API rate-limits concurrent requests.
         with _garmin_api_lock:
             # Re-check inside the lock in case another thread just populated it.
-            cached = read_from_disk_cache(he_key, max_age_seconds=max_age)
-            if cached is not None and not (isinstance(cached, str) and cached.startswith("Error ")):
+            cached = read_cache(he_key)
+            if usable(cached):
                 return cached
             result = getattr(self._real, name)(*call_args)
-        write_to_disk_cache(he_key, result)
+        # Never cache an empty result for recent dates (max_age set): the data
+        # may simply not have synced from the watch yet.
+        if not (max_age is not None and is_empty_result(result)):
+            write_to_disk_cache(he_key, result)
         return result
 
     def __getattr__(self, name):
@@ -467,8 +526,12 @@ async def prefetch_background_daemon(garmin_client):
             async def fetch_and_cache(func_name, cache_kwargs, client_method_name, *method_args, max_age_seconds=None, **method_kwargs):
                 cache_key = get_cache_key(func_name, (), cache_kwargs)
                 
-                # Check if already in disk cache
-                cached_val = read_from_disk_cache(cache_key, max_age_seconds=max_age_seconds)
+                # Check if already in disk cache. For recent dates (max_age set),
+                # empty entries are cleaned from disk and treated as misses.
+                if max_age_seconds is not None:
+                    cached_val = read_recent_from_disk_cache(cache_key, max_age_seconds=max_age_seconds)
+                else:
+                    cached_val = read_from_disk_cache(cache_key)
                 if cached_val is not None:
                     return cached_val
                 
@@ -481,9 +544,14 @@ async def prefetch_background_daemon(garmin_client):
                 try:
                     result = await asyncio.to_thread(run_api)
                     json_result = _to_json_str(result)
-                    
-                    # Store result in permanent disk cache
-                    write_to_disk_cache(cache_key, json_result)
+
+                    # Store result in permanent disk cache — but never cache an
+                    # empty result for recent dates (max_age set), as the data
+                    # may simply not have synced from the watch yet.
+                    if max_age_seconds is not None and is_empty_result(json_result):
+                        print(f"[PREFETCH] Empty result for '{func_name}' with kwargs={cache_kwargs}; skipping cache for recent date.", file=sys.stderr, flush=True)
+                    else:
+                        write_to_disk_cache(cache_key, json_result)
                     
                     # Respect rate limits: sleep 3.0s after a real API request
                     await asyncio.sleep(3.0)
@@ -548,7 +616,11 @@ async def prefetch_background_daemon(garmin_client):
                 # Check each daily endpoint
                 for func_name, client_method in daily_endpoints:
                     cache_key = get_cache_key(func_name, (), {"date": query_date_str})
-                    if read_from_disk_cache(cache_key, max_age_seconds=max_age) is not None:
+                    if max_age is not None:
+                        cached_daily = read_recent_from_disk_cache(cache_key, max_age_seconds=max_age)
+                    else:
+                        cached_daily = read_from_disk_cache(cache_key)
+                    if cached_daily is not None:
                         skipped_count += 1
                         await asyncio.sleep(0.01)
                         continue
@@ -695,8 +767,9 @@ def main():
                             print(f"[CACHE] Memory cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                             return val
 
-                    # Check disk cache with a 4-hour TTL for recent/dynamic queries
-                    cached_val = read_from_disk_cache(cache_key, max_age_seconds=14400)
+                    # Check disk cache with a 4-hour TTL for recent/dynamic queries.
+                    # Empty entries are cleaned and treated as misses.
+                    cached_val = read_recent_from_disk_cache(cache_key, max_age_seconds=14400)
                     if cached_val is not None and not (isinstance(cached_val, str) and cached_val.startswith("Error ")):
                         print(f"[CACHE] Recent disk cache HIT for '{func_name}' with kwargs={kw} (key: {cache_key})", file=sys.stderr, flush=True)
                         _mem_cache[cache_key] = (now, cached_val)
@@ -724,6 +797,11 @@ def main():
                 # 5. Store result in appropriate cache (skip on transient errors)
                 if isinstance(result, str) and result.startswith("Error "):
                     print(f"[CACHE] Skipping cache for '{func_name}' due to error result (key: {cache_key}).", file=sys.stderr, flush=True)
+                elif not is_permanent_query(func_name, kw) and is_empty_result(result):
+                    # Recent/dynamic query returned nothing — data may not have
+                    # synced yet, so don't cache it (it would be served stale for
+                    # up to 4h, or permanently once the date ages past 7 days).
+                    print(f"[CACHE] Skipping cache for '{func_name}' due to empty result on recent/dynamic query (key: {cache_key}).", file=sys.stderr, flush=True)
                 elif is_permanent_query(func_name, kw):
                     print(f"[CACHE] Storing result for '{func_name}' in permanent disk cache (key: {cache_key}).", file=sys.stderr, flush=True)
                     write_to_disk_cache(cache_key, result)

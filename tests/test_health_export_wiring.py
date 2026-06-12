@@ -134,3 +134,77 @@ def test_cached_client_per_day_and_passthrough(gm, tmp_path, monkeypatch):
 
     # Unknown methods pass straight through to the real client.
     assert c.get_full_name() == "Tim"
+
+
+# --- empty-result handling ---------------------------------------------------
+def test_is_empty_result(gm):
+    assert gm.is_empty_result(None)
+    assert gm.is_empty_result({})
+    assert gm.is_empty_result([])
+    assert gm.is_empty_result("")
+    assert gm.is_empty_result("   ")
+    assert gm.is_empty_result("null")
+    assert gm.is_empty_result("{}")
+    assert gm.is_empty_result("[]")
+    assert not gm.is_empty_result({"a": 1})
+    assert not gm.is_empty_result([0])
+    assert not gm.is_empty_result('{"a": 1}')
+    assert not gm.is_empty_result("No HRV data found for 2026-06-12.")
+    assert not gm.is_empty_result(0)
+
+
+def test_read_recent_cleans_empty_entries(gm, tmp_path, monkeypatch):
+    monkeypatch.setattr(gm, "tokenstore", str(tmp_path))
+
+    # An empty cached entry is deleted from disk and reported as a miss.
+    gm.write_to_disk_cache("k_empty", {})
+    assert gm.read_recent_from_disk_cache("k_empty", max_age_seconds=14400) is None
+    assert gm.read_from_disk_cache("k_empty") is None  # file is gone
+
+    # Same for empty JSON-string entries (the tool wrapper stores strings).
+    gm.write_to_disk_cache("k_empty_str", "[]")
+    assert gm.read_recent_from_disk_cache("k_empty_str", max_age_seconds=14400) is None
+    assert gm.read_from_disk_cache("k_empty_str") is None
+
+    # Non-empty entries are returned and kept.
+    gm.write_to_disk_cache("k_full", {"steps": 8000})
+    assert gm.read_recent_from_disk_cache("k_full", max_age_seconds=14400) == {"steps": 8000}
+    assert gm.read_from_disk_cache("k_full") == {"steps": 8000}
+
+    # TTL still applies to non-empty entries.
+    assert gm.read_recent_from_disk_cache("k_full", max_age_seconds=-1) is None
+
+
+def test_cached_client_skips_empty_for_recent_dates(gm, tmp_path, monkeypatch):
+    import datetime
+
+    monkeypatch.setattr(gm, "tokenstore", str(tmp_path))
+    recent = datetime.date.today().strftime("%Y-%m-%d")
+    old = "2020-01-02"
+    calls = []
+
+    class Real:
+        def get_rhr_day(self, d):
+            calls.append(d)
+            return {}
+
+    c = gm._HealthExportCachedClient(Real())
+
+    # Recent date returning empty (data may not have synced yet): never
+    # cached, so every call goes to the API.
+    assert c.get_rhr_day(recent) == {}
+    assert c.get_rhr_day(recent) == {}
+    assert calls.count(recent) == 2
+
+    # A pre-existing empty entry in the shared cache for a recent date is
+    # treated as a miss AND cleaned from disk.
+    shared_key = gm.get_cache_key("get_rhr_day", (), {"date": recent})
+    gm.write_to_disk_cache(shared_key, {})
+    assert c.get_rhr_day(recent) == {}
+    assert calls.count(recent) == 3
+    assert gm.read_from_disk_cache(shared_key) is None  # entry was deleted
+
+    # Old date returning empty is final data: cached after the first call.
+    assert c.get_rhr_day(old) == {}
+    assert c.get_rhr_day(old) == {}
+    assert calls.count(old) == 1
